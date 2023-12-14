@@ -1,0 +1,48 @@
+import gzip
+import pickle
+
+class REF_KMER:
+    kmer: int
+    name: int
+    index: int
+    repeat: int
+    def __init__(self, kmer, name, index, repeat):
+        self.kmer = kmer
+        self.name = name
+        self.index = index
+        self.repeat = repeat
+
+class SNP_KMER:
+    kmer: int
+    name: int
+    index: int
+    pos: int
+    ref_freq: int
+    alt_freq: int
+    repeat: int
+    def __init__(self, kmer, name, index, pos, ref_freq, alt_freq, repeat):
+        self.kmer = kmer
+        self.name = name
+        self.index = index
+        self.pos = pos
+        self.ref_freq = ref_freq
+        self.alt_freq = alt_freq
+        self.repeat = repeat
+
+# save an object to a file using pickle and gzip compression to save space
+def save_output[T](obj: T, file_name:str):
+    with gzip.open(file_name, 'wb') as f:
+        pickle.dump(obj, f)
+
+# load an object from a file using pickle and gzip compression to save space
+def load_output[T](file_name: str) -> T:
+    with gzip.open(file_name, 'rb') as f:
+        return pickle.load(f)
+
+# encode a genomic position with base and alternate base
+def encode_position(pos, base, alt):
+    return ((pos << 16) | (ord(base) << 8) | ord(alt))
+
+# decode the position, base, and alternate base from an encoded integer
+def decode_position(pos):
+    return (((pos >> 16) & 0x0000ff), chr((pos >> 8) & 0x0000ff), chr(pos & 0x0000ff))
