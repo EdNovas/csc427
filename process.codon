@@ -1,0 +1,426 @@
+from util import REF_KMER, SNP_KMER
+from util import load_output
+from util import decode_position
+import math
+from bio import *
+
+KMER_LEN = 32
+JUMP_MASK_LO = 0x00000000ffffffff
+MAX_COV = 31
+AVG_COV = 7.1
+GTYPE_NONE = 0
+GTYPE_REF = 1
+GTYPE_ALT = 2
+GTYPE_HET = 3
+ERR_RATE = 0.01
+
+# store index table entries as a dictionary
+class IndexTableEntry:
+    entries: dict[int,int]
+    def __init__(self):
+        self.entries = {}
+
+    def __getitem__(self, key):
+        return next(iter(self.entries.values()))
+
+    def __contains__(self, key):
+        return key in self.entries
+
+    def __setitem__(self, key, value):
+        self.entries[key] = value
+
+# k-mer's value and position
+class KmerContext:
+    kmer: int
+    position: int
+    name: int
+    index: int
+    def __init__(self, kmer, position, name, index):
+        self.kmer = kmer
+        self.position = position
+        self.name = name
+        self.index = index
+
+# a genotype call wtih type and confidence level
+class Call:
+    genotype: int
+    confidence: float
+    def __init__(self, genotype, confidence):
+        self.genotype = genotype
+        self.confidence = confidence
+
+# cache structure for genotype call
+class CacheStruct:
+    g0: float
+    g1: float
+    g2: float
+    def __init__(self, g0, g1, g2):
+        self.g0 = g0
+        self.g1 = g1
+        self.g2 = g2
+
+# extract the higher 32 bits from a 64-bit integer and adjust the value, create a higher-level index for large numbers
+def hi(target):
+    return (target >>32) + 2147483648
+
+# create a jumpgate for efficient searching of k-kmers
+def jumpgate_factory(kmers):
+    jumpgate = list[int](JUMP_MASK_LO)
+    jumpgate.append(0)
+    size = len(kmers) - 1
+    max_name = -1
+    max_index = -1
+    # iterate through k-kmers to populate the jumpgate
+    for index, member in enumerate(kmers):
+        if member.name > max_name or member.index > max_index:
+            max_name = member.name
+            max_index = member.index
+        hi_encode = hi(member.kmer)
+        while (hi_encode >= len(jumpgate)):
+            jumpgate.append(index)
+    # fill remaining entries in jumpgate if not equal to mask length
+    if len(jumpgate) != JUMP_MASK_LO:
+        while (JUMP_MASK_LO > len(jumpgate)):
+            jumpgate.append(size)
+    return jumpgate
+
+# binary search to find a k-mer in a sorted list
+def bsearch(kmers, fr, to, target):
+    if target == kmers[fr].kmer:
+        return fr
+    if target == kmers[to].kmer:
+        return to
+    if target < kmers[fr].kmer or target > kmers[to].kmer:
+        return -1
+    mid = int((fr + to) / 2)
+    if mid == fr:
+        return -1
+    return bsearch(kmers, mid, to, target) if target > kmers[mid].kmer else bsearch(kmers, fr, mid, target)
+
+# query a k-mer in a dictionary using a jumpgate for efficiency
+def query_dict(kmers, jumpgate, target):
+    key = hi(target)
+    # key out of jumpgate range
+    if key > len(jumpgate):
+        return -1
+    f = jumpgate[key]
+    t = jumpgate[key + 1] if key < len(jumpgate) -1 else jumpgate[key]
+    return bsearch(kmers, f, t, target)
+
+# yield neighboring k-mers of a given k-mer, each neighbor differs by one base at a specific position
+def neighbor_with_pos(kmer):
+    for i in range(len(str(kmer))):
+        kmer_str = str(kmer)
+        for b in (k'A', k'T', k'C', k'G'):
+            if kmer_str[i] != str(b):
+                yield (i, kmer |> base(i,b))
+
+# keep track of k-mer hits
+class IndexTable:
+    best: tuple[int, int, int]    # best hit in terms of frequency
+    best_is_ambig: bool    # Flag indicating if the best hit is ambiguous
+    entries: dict[int, IndexTableEntry]    # dictionary storing IndexTableEntry objects
+    def __init__(self):
+        self.best = (-1,-1,-1)
+        self.best_is_ambig = False
+        self.entries = dict[int,IndexTableEntry]()
+
+    def clear_index(self, name, index):
+        if name in self.entries:
+            if index in self.entries[name]:
+                self.entries[name][index] = 0
+
+    def clear(self):
+        self.entries.clear()
+
+    def add(self, name, index):
+        if name not in self.entries:
+            self.entries[name] = IndexTableEntry()
+        if index not in self.entries[name]:
+            self.entries[name][index] = 0
+        self.set_best(name, index, self.entries[name][index])
+
+    def set_best(self, name, index, freq):
+        if self.best[2] < freq:
+            self.best = (name, index, freq)
+            self.best_is_ambig = False
+        elif self.best[2] == freq:
+            self.best_is_ambig = False if self.best[0] == name and self.best[1]==index else True
+
+# a pileup entry for a SNP
+class PileupEntry:
+    ref: str    # reference allele
+    alt: str    # alternate allele
+    ref_freq: int    # frequency of the reference allele
+    alt_freq: int    # frequency of the alternate allele
+    ref_cnt: int    # count of the reference allele
+    alt_cnt: int    # count of the alternate allele
+    def __init__(self, snp):
+        _, self.ref, self.alt = decode_position(snp.pos)
+        self.ref_freq = snp.ref_freq
+        self.alt_freq = snp.alt_freq
+        self.ref_cnt = self.alt_cnt = 0
+
+    def __init__(self):
+        self.ref=self.alt=''
+
+    def __str__(self):
+        return str((self.ref, self.alt, self.ref_freq, self.alt_freq, self.ref_cnt, self.alt_cnt))
+
+# handle genotype
+class Genotype:
+    ref_kmers: list[REF_KMER]
+    ambig_ref: dict[int, list[REF_KMER]]
+    ref_jumpgate: list[int]
+    snp_kmers: list[SNP_KMER]
+    ambig_snp: dict[int, list[SNP_KMER]]
+    snp_jumpgate: list[int]
+    pileup_table: dict[int, dict[int,PileupEntry]]
+    ref_hit_contexts: list[KmerContext]
+    snp_hit_contexts: list[KmerContext]
+    index_table: IndexTable
+    init_call: bool
+    poisson: list[float]
+    call_cache: list[list[CacheStruct]]
+    calls: list[tuple[str,int,int,float]]
+
+    def __init__(self):
+        self.pileup_table = dict[int, dict[int,PileupEntry]]()
+        self.ref_hit_contexts = list[KmerContext]()
+        self.snp_hit_contexts = list[KmerContext]()
+        self.index_table = IndexTable()
+        self.init_call = True
+        self.poisson = list[float]()
+        self.fill_poisson()
+
+    # populate the poisson distribution values based on average coverage
+    # calculate genotype probabilities
+    def fill_poisson(self):
+        m = math.exp(-AVG_COV)
+        for i in range(2 * MAX_COV):
+            entry = (m * math.pow(AVG_COV, float(i))) / math.exp(math.lgamma(i+1.0))
+            self.poisson.append(entry)
+
+    # processes SNP kmers to create a pileup table
+    def pileup(self):
+        for snp in self.snp_kmers:
+            if snp.repeat == 0:
+                if snp.name not in self.pileup_table:
+                    self.pileup_table[snp.name] = dict[int, PileupEntry]()
+                self.pileup_table[snp.name][snp.index] = PileupEntry(snp)
+
+    # retrieve a specific pileup entry given a name and index
+    def get_pileup_entry(self, name, index):
+        if name in self.pileup_table:
+            if index in self.pileup_table[name]:
+                return self.pileup_table[name][index]
+        return PileupEntry()
+
+    def initialize(self, out_snp_dict, out_ref_dict):
+        self.ref_kmers = load_output(out_ref_dict)
+        self.ambig_ref = load_output(out_ref_dict + '_ambig')
+        self.snp_kmers = load_output(out_snp_dict)
+        self.pileup()
+        self.ambig_snp = load_output(out_snp_dict + '_ambig')
+        self.snp_jumpgate = jumpgate_factory(self.snp_kmers)
+        self.ref_jumpgate = jumpgate_factory(self.ref_kmers)
+
+    # stores a kmer match hit in the context list
+    def store_hit(self, kmer, hit, kmers, contexts, ambig, offset):
+        k = kmers[hit]
+        if k.repeat == 0:
+            read_pos = k.index - offset
+            contexts.append(KmerContext(kmer, read_pos, k.name, k.index))
+            self.index_table.add(k.name, read_pos)
+        # ambiguous
+        elif k.repeat < 10:
+            for ref in ambig[kmer]:
+                read_pos = ref.index - offset
+                contexts.append(KmerContext(kmer,read_pos, ref.name, ref.index))
+                self.index_table.add(ref.name, read_pos)
+
+    # stores matches for both reference and SNP k-mers
+    def store_hits(self, kmer, ref_hit, snp_hit, offset):
+        if ref_hit > -1:
+            self.store_hit(kmer, ref_hit, self.ref_kmers, self.ref_hit_contexts, self.ambig_ref, offset)
+        if snp_hit > -1:
+            self.store_hit(kmer, snp_hit, self.snp_kmers, self.snp_hit_contexts, self.ambig_snp, offset)
+
+    # query both reference and SNP kmer dict
+    def query_dicts(self, kmer):
+        return (query_dict(self.ref_kmers, self.ref_jumpgate, kmer), query_dict(self.snp_kmers, self.snp_jumpgate, kmer))
+
+    # store a single kmer hits and handle neighbor kmers
+    def process_kmer(self, kmer, position):
+        ref_hit, snp_hit = self.query_dicts(kmer)
+        self.store_hits(kmer, ref_hit, snp_hit, position)
+        for p, n in neighbor_with_pos(kmer):
+            neighbor = int(n.as_int())
+            ref_hit,snp_hit = self.query_dicts(neighbor)
+            self.store_hits(neighbor, ref_hit, snp_hit, p)
+
+    # update counts of reference and alternate alleles
+    def update_counts(self, context):
+        for p, b in enumerate(str(context.kmer)):
+            entry = self.get_pileup_entry(context.name, p + context.index)
+            if entry.ref == b:
+                entry.ref_cnt += (1 if entry.ref_cnt < MAX_COV else 0)
+            elif entry.alt == b:
+                entry.alt_cnt += (1 if entry.ref_cnt < MAX_COV else 0)
+
+    # update counts if the current context is the target of processing
+    def update_table(self, context, process_read, target_index):
+        # clear
+        self.index_table.clear_index(context.name, context.position)
+        if process_read and (context.name == target_index[0] and context.position == target_index[1]):
+            self.update_counts(context)
+
+    # update the pileup table based on the best hits from the index table
+    def update_pileup(self):
+        process_read = self.index_table.best[2] != -1 and not self.index_table.best_is_ambig
+        target_index = (self.index_table.best[0], self.index_table.best[1])
+        for ref_context in self.ref_hit_contexts:
+            self.update_table(ref_context, process_read, target_index)
+        for snp_context in self.snp_hit_contexts:
+            self.update_table(snp_context, process_read, target_index)
+        return process_read
+    
+    # from cookbook source code
+    # https://github.com/seq-lang/seq/blob/master/stdlib/bio/seq.seq
+    def kmers_with_pos(self, step: int = 1, k: Static[int]):
+        '''
+        Iterator over (0-based index, k-mer) tuples of the given
+        sequence with the specified step size. Note that k-kmers
+        spanning ambiguous bases will be skipped.
+        '''
+        # This function is intentionally written this way. It could be simplified,
+        # but this version was found to be the most performant due to inlining etc.
+        K = Kmer[k]
+        if self.len >= 0:
+            n = self.len
+            i = 0
+            kmer = K()
+            refresh = True
+            while i + k <= n:
+                if refresh:
+                    sub = self._slice_fwd(i, i + k)
+                    if not sub.N():
+                        kmer = K._make_fwd(sub.ptr, k)
+                        refresh = step >= k
+                        yield (i, kmer)
+                else:
+                    sub = self._slice_fwd(i + k - step, i + k)
+                    if not sub.N():
+                        kmer = kmer._lsh_fwd(sub.ptr, step)
+                        yield (i, kmer)
+                    else:
+                        refresh = True
+                i += step
+        else:
+            n = -self.len
+            i = 0
+            kmer = K()
+            refresh = True
+            while i + k <= n:
+                if refresh:
+                    sub = self._slice_rev(i, i + k)
+                    if not sub.N():
+                        kmer = K._make_rev(sub.ptr, k)
+                        refresh = step >= k
+                        yield (i, kmer)
+                else:
+                    sub = self._slice_rev(i + k - step, i + k)
+                    if not sub.N():
+                        kmer = kmer._lsh_rev(sub.ptr, step)
+                        yield (i, kmer)
+                    else:
+                        refresh = True
+                i += step
+    
+    def process_read(self, read, rev_compl):
+        self.ref_hit_contexts.clear()
+        self.snp_hit_contexts.clear()
+        if rev_compl:
+            read = ~read
+        for position, kmer in read.kmers_with_pos(1, 32):
+            self.process_kmer(int(kmer.as_int()), position)
+        if not self.update_pileup() and not rev_compl:
+            self.process_read(read, True)
+
+    # return a CacheStruct for a pileup entry
+    def cache_struct(self, entry):
+        g0 = math.pow(1.0 - ERR_RATE, float(entry.ref_cnt)) * math.pow(ERR_RATE, float(entry.alt_cnt))
+        g1 = math.pow(0.5, float(entry.ref_cnt + entry.alt_cnt))
+        g2 = math.pow(ERR_RATE, float(entry.ref_cnt)) * math.pow(1.0 - ERR_RATE, float(entry.alt_cnt))
+        return CacheStruct(g0,g1,g2)
+
+    # cache for genotype calling
+    def initialize_call_cache(self, entry):
+        self.call_cache = list[list[CacheStruct]]()
+        for i in range(MAX_COV):
+            for j in range(MAX_COV):
+                self.call_cache.append(list[CacheStruct]())
+                self.call_cache[i].append(self.cache_struct(entry))
+
+    # choose the best genotype
+    def choose_best_genotype(self, entry):
+        if self.init_call:
+            self.initialize_call_cache(entry)
+            self.init_call = False
+        if (entry.ref_cnt == 0 and entry.alt_cnt == 0):
+            return Call(GTYPE_NONE, 0.0)
+        if (entry.ref_cnt >= MAX_COV and entry.alt_cnt >= MAX_COV):
+            return Call(GTYPE_NONE, 0.0)
+        cache = self.call_cache
+        # probabilities of being homozygous for the reference allele, heterozygous, and homozygous for the alternate allele
+        g0 = cache[entry.ref_cnt][entry.alt_cnt].g0 
+        g1 =cache[entry.ref_cnt][entry.alt_cnt].g1
+        g2 = cache[entry.ref_cnt][entry.alt_cnt].g2
+        # normalized frequency of the reference allele and alternate allele
+        p = entry.ref_freq/255.0
+        q = entry.alt_freq/255.0
+        # probability of homozygous reference genotype, heterozygous genotype, and homozygous alternate genotype
+        p_g0 = p * p * g0
+        p_g1 = (1.0 - p * p - q * q) * g1
+        p_g2 = q * q * g2
+        total = p_g0 + p_g1 + p_g2
+        n = entry.ref_cnt + entry.alt_cnt
+        # choose the most likely genotype based on the probability
+        if p_g0 > p_g1 and p_g0 > p_g2:
+            return Call(GTYPE_REF, (p_g0/total)*self.poisson[n])
+        elif p_g1 > p_g0 and p_g1 > p_g2:
+            return Call(GTYPE_HET, (p_g1/total)*self.poisson[n])
+        else:
+            return Call(GTYPE_ALT, (p_g2/total)*self.poisson[n])
+
+    # make a genotype call and append it to the list of calls
+    def make_call(self, call, name, index):
+        match call.genotype:
+            case GTYPE_ALT:
+                self.calls.append(('Alt', name, index, call.confidence))
+            case GTYPE_HET:
+                self.calls.append(('Het', name, index, call.confidence))
+            case _:
+                pass
+
+    # go over the pileup table and make genotype calls for each entry
+    def make_calls(self):
+        self.init_call = True
+        self.calls = list[tuple[str,int,int,float]]()
+        for n,v in self.pileup_table.items():
+            for i, entry in v.items():
+                if entry.ref == entry.alt:
+                    continue
+                self.make_call(self.choose_best_genotype(entry), n, i)
+
+def process(out_ref_dict, out_snp_dict, fastq_file, output):
+    gtype = Genotype()
+    gtype.initialize(out_snp_dict, out_ref_dict)
+    for read in FASTQ(fastq_file):
+        gtype.process_read(read.seq, False)
+    gtype.make_calls()
+    for call in gtype.calls:
+        print(call)
+    with open(output, 'w') as f:
+        for call in gtype.calls:
+            f.write(f'call \n')
