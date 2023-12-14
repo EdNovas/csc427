@@ -1,0 +1,33 @@
+import sys
+from preprocess import preprocess
+from process import process
+
+# dict
+if sys.argv[1] == 'dict':
+    if len(sys.argv) == 6:
+        ref_file = sys.argv[2]
+        snp_list = sys.argv[3]
+        out_ref_dict = sys.argv[4]
+        out_snp_dict = sys.argv[5]
+        preprocess(ref_file, snp_list, out_ref_dict, out_snp_dict)
+    else:
+        print('Input Parameter Error')
+        print('Preprocessing: codon run -plugin seq main.codon dict <input FASTA> <input SNP list> <output ref dict> <output SNP dict>')
+        sys.exit(1)
+# lava
+elif sys.argv[1] == 'lava':
+    if len(sys.argv) == 6:
+        out_ref_dict = sys.argv[2]
+        out_ref_dict = sys.argv[3]
+        reads_filename = sys.argv[4]
+        output_file = sys.argv[5]
+        process(out_ref_dict, out_snp_dict, reads_filename, output_file)
+    else:
+        print('Input Parameter Error')
+        print('Processing: codon run -plugin seq main.codon lava <input ref dict> <input SNP dict> <input FASTQ> <output file>')
+        sys.exit(1)
+else:
+    print('Input Parameter Error')
+    print('Preprocessing: codon run -plugin seq main.codon dict <input FASTA> <input SNP list> <output ref dict> <output SNP dict>')
+    print('Processing: codon run -plugin seq main.codon lava <input ref dict> <input SNP dict> <input FASTQ> <output file>')
+    sys.exit(1)
