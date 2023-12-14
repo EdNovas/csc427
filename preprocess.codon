@@ -1,0 +1,298 @@
+from util import REF_KMER, SNP_KMER
+from util import encode_position, decode_position
+from util import save_output
+from bio import *
+
+KMER_LEN = 32
+INITIAL_REF_SIZE = 100000000
+
+# count different types of k-mers
+class MER_COUNTER:
+    unambig: int
+    unique_ambig: int
+    total_ambig: int
+    overflow: int
+    def __init__(self, unambig, unique_ambig, total_ambig, overflow):
+        self.unambig = unambig
+        self.unique_ambig = unique_ambig
+        self.total_ambig = total_ambig
+        self.overflow = overflow
+
+class SNP:
+    kmer_len: int
+    chromosome: str
+    index: int
+    count_field: int
+    ref_base: str
+    ref_base2: str
+    snp_type: str
+    strand: str
+    alt_field: str
+    alleles: list[str]
+    freqs: list[int]
+    valid: bool
+    def __init__(self, line):
+        lines = line.split()
+        len_lines = len(lines)
+        self.valid = False
+        self.kmer_len = KMER_LEN
+        self.chromosome = lines[1]
+        self.index = int(lines[2])
+        self.strand = lines[6]
+        self.ref_base = lines[7].upper()
+        self.ref_base2 = lines[8].upper()
+        self.alt_field = lines[9]
+        self.snp_type = lines[11]
+        if not self.is_valid():
+            return
+        if len_lines <= 21:
+            return
+        else:
+            if lines[21] != '2':
+                return
+            self.count_field = int(lines[21])
+            self.alleles = self.set_alleles(lines[22].split(','))
+            self.freqs = self.set_freqs(lines[24].split(','))
+        if self.strand not in '-+':
+            raise ValueError('Strand should be + or - :' + line)
+        if (self.alleles[0] == self.ref_base or self.alleles[1] == self.ref_base):
+            self.valid = True
+
+    # set frequencies for a SNP
+    def set_freqs(self, freqs = list[float]):
+        if self.alleles[1] == self.ref_base:
+            tmp = freqs[0]
+            freqs[0] = freqs[1]
+            freqs[1] = tmp
+        return [int(float(f) * 255) for f in freqs if f != '']
+
+    def complement(self, allele):
+        allele = seq(allele)
+        return str(~allele)
+
+    # set alleles for a SNP
+    def set_alleles(self, alleles):
+        if self.strand == '-':
+            alleles[0] = self.complement(alleles[0])
+            alleles[1] = self.complement(alleles[1])
+        return [l.strip() for l in alleles if l.strip() != '']
+
+    # check if a SNP is valid
+    def is_valid(self):
+        return self.ref_base in 'ACGT' and self.index >= self.kmer_len - 1  and self.snp_type == 'single' and self.ref_base == self.ref_base2 and len(self.ref_base) == len(self.ref_base2) == 1
+
+    def __str__(self):
+        return 'Chromosome: ' + self.chromosome + ' ('+ self.strand + str(self.index) +') ' + self.snp_type + ': ' + self.ref_base + ', ' + self.ref_base2 + ' ' + self.alt_field + ': ' + str(self.alleles) + '('+str(self.freqs)+')' + '\n' + self.line
+    
+    # from cookbook source code
+    # https://github.com/seq-lang/seq/blob/master/stdlib/bio/seq.seq
+    def kmers_with_pos(self, step: int = 1, k: Static[int]):
+        '''
+        Iterator over (0-based index, k-mer) tuples of the given
+        sequence with the specified step size. Note that k-mers
+        spanning ambiguous bases will be skipped.
+        '''
+        # This function is intentionally written this way. It could be simplified,
+        # but this version was found to be the most performant due to inlining etc.
+        K = Kmer[k]
+        if self.len >= 0:
+            n = self.len
+            i = 0
+            kmer = K()
+            refresh = True
+            while i + k <= n:
+                if refresh:
+                    sub = self._slice_fwd(i, i + k)
+                    if not sub.N():
+                        kmer = K._make_fwd(sub.ptr, k)
+                        refresh = step >= k
+                        yield (i, kmer)
+                else:
+                    sub = self._slice_fwd(i + k - step, i + k)
+                    if not sub.N():
+                        kmer = kmer._lsh_fwd(sub.ptr, step)
+                        yield (i, kmer)
+                    else:
+                        refresh = True
+                i += step
+        else:
+            n = -self.len
+            i = 0
+            kmer = K()
+            refresh = True
+            while i + k <= n:
+                if refresh:
+                    sub = self._slice_rev(i, i + k)
+                    if not sub.N():
+                        kmer = K._make_rev(sub.ptr, k)
+                        refresh = step >= k
+                        yield (i, kmer)
+                else:
+                    sub = self._slice_rev(i + k - step, i + k)
+                    if not sub.N():
+                        kmer = kmer._lsh_rev(sub.ptr, step)
+                        yield (i, kmer)
+                    else:
+                        refresh = True
+                i += step
+    
+    # generates k-mers
+    def generate_kmers(self, s, alt, kmers, read_idx):
+        t = [c for c in s]
+        t[self.kmer_len -1] = alt[0]
+        base = s[self.kmer_len-1]
+        p = ''.join(t).upper()
+        s = seq(s)
+        p = seq(p)
+        # calculates the position of the SNP and encodes it into bytes
+        for ref_pair, snp_pair in zip(s.kmers_with_pos(1, 32), p.kmers_with_pos(1, 32)):
+            snp_pos, snp = snp_pair
+            _ , ref = ref_pair
+            counter = self.index - self.kmer_len + 1 + snp_pos
+            pos = self.index - counter
+            encoded_pos = encode_position(pos, base, alt)
+            kmer = int(snp.as_int())
+            temp_snp_kmer = SNP_KMER(kmer, read_idx, counter, encoded_pos , self.freqs[0], self.freqs[1],0)
+            kmers.append(temp_snp_kmer)
+
+    # extracting k-mers from a given ref sequence around the SNP position
+    def get_kmers(self, ref, kmers, read_idx):
+        # upper case
+        s = str(ref[self.index-self.kmer_len+1: self.index+self.kmer_len]).upper()
+        base = s[self.kmer_len-1]
+        # check if the reference base matches the SNP file
+        if base != self.ref_base:
+            raise ValueError('Mismatch found between reference sequence and SNP file')
+        # checks if it needs to complement the alleles
+        for i in self.alt_field:
+            if self.strand == '-':
+                i = self.complement(i)
+            if i != self.ref_base and i in 'ACGT':
+                self.generate_kmers(s, i, kmers, read_idx)
+
+# initialize a dictionary of SNPs from a list of SNPs
+def initialize_snp_dict(snp_list):
+    with open(snp_list, 'r') as snp_file:
+        snp_dict = dict[str,list[SNP]]()
+        for line in snp_file:
+            if line[0] != '#' and line[0] != '\n':
+                snp = SNP(line)
+                if snp.valid:
+                    if snp.chromosome not in snp_dict:
+                        snp_dict[snp.chromosome] = list[SNP]()
+                    snp_dict[snp.chromosome].append(snp)
+    return snp_dict
+
+def get_kmers(ref, snps, kmers, read_idx):
+    for snp in snps:
+        snp.get_kmers(ref, kmers, read_idx)
+    return kmers
+
+# increment counters
+def increment(counter, repeat):
+    if repeat == 0:
+        counter.unambig += 1
+    else:
+        counter.unique_ambig += 1
+        counter.total_ambig += repeat + 1
+        if repeat > 10:
+            counter.overflow += 1
+
+# add a reference k-mer to the output list
+def add_ref(ref, repeat, kmers, counter):
+    kmers.append(REF_KMER(ref.kmer, ref.name, ref.index, repeat))
+    increment(counter, repeat)
+
+# add a SNP k-mer to the output list
+def add_snp(snp, repeat, kmers, counter):
+    kmers.append(SNP_KMER(snp.kmer, snp.name, snp.index,snp.pos, snp.ref_freq, snp.alt_freq, repeat))
+    increment(counter, repeat)
+
+# print counters
+def print_kmer_counters(total_kmers, counters):
+    print('Total k-mers: ', total_kmers)
+    print('unambig k-mers: ', counters.unambig)
+    print('Ambig unique k-mers: ', counters.unique_ambig)
+    print('Ambig total k-mers: ', counters.total_ambig)
+
+def ref_sort(left):
+    return left.kmer
+
+def preprocess(ref_file, snp_list, out_ref_dict, out_snp_dict):
+    # snp
+    snp_dict = initialize_snp_dict(snp_list)
+    snp_array = list[SNP_KMER]()
+    ref_array = list[REF_KMER](INITIAL_REF_SIZE)
+    chr_names = list[str]()
+    for read in FASTA(ref_file, fai = False):
+        chr_names.append(read.name)
+        read_idx = len(chr_names) - 1
+        if read.name in snp_dict:
+            get_kmers(read.seq, snp_dict[read.name], snp_array, read_idx)
+        else:
+            for position, kmer in read.seq.kmers_with_pos(1, 32):
+                ref_array.append(REF_KMER(int(kmer.as_int()),read_idx, position, 0))
+    # process snp array
+    total_kmers = 0
+    counters = MER_COUNTER(0, 0, 0, 0)
+    last_snp = SNP_KMER(-1, -1, -1, -1, -1, -1, -1)
+    last_repeat = -1
+    ambig_snp = dict[int, list[SNP_KMER]]()
+    snp_kmers = list[SNP_KMER]()
+    for snp in snp_array:
+        total_kmers += 1
+        if last_repeat == -1:
+            last_snp = snp
+            last_repeat = 0
+        elif snp.kmer != last_snp.kmer:
+            add_snp(last_snp, last_repeat, snp_kmers, counters)
+            last_snp = snp
+            last_repeat = 0
+        elif last_repeat == 0:
+            ambig_snp[snp.kmer] = [last_snp]
+            last_snp = snp
+            last_repeat = 1
+        else:
+            if len(ambig_snp[snp.kmer]) < 10:
+                ambig_snp[snp.kmer].append(last_snp)
+            last_snp = snp
+            last_repeat += 1
+    add_snp(last_snp, last_repeat, snp_kmers, counters)
+    print('SNP Dictionary')
+    print_kmer_counters(total_kmers, counters)
+    # save into output files
+    save_output(snp_kmers, out_ref_dict)
+    save_output(ambig_snp, out_ref_dict + '_ambig')
+
+    # ref
+    ref_array = sorted(ref_array, key = ref_sort)
+    total_kmers = 0
+    counters = MER_COUNTER(0, 0, 0, 0)
+    last_ref = REF_KMER(-1, -1, -1, -1)
+    last_repeat = -1
+    ambig_ref = dict[int, list[REF_KMER]]()
+    ref_kmers = list[REF_KMER](INITIAL_REF_SIZE)
+    for ref in ref_array:
+        total_kmers += 1
+        if last_repeat == -1:
+            last_ref = ref
+            last_repeat = 0
+        elif ref.kmer != last_ref.kmer:
+            add_ref(last_ref, last_repeat, ref_kmers, counters)
+            last_ref = ref
+            last_repeat = 0
+        elif last_repeat == 0:
+            ambig_ref[ref.kmer] = [last_ref]
+            last_ref = ref
+            last_repeat = 1
+        else:
+            if len(ambig_ref[ref.kmer]) < 10:
+                ambig_ref[ref.kmer].append(last_ref)
+            last_ref = ref
+            last_repeat += 1
+    add_ref(last_ref, last_repeat, ref_kmers, counters)
+    print('REF Dictionary')
+    print_kmer_counters(total_kmers, counters)
+    save_output(ref_kmers, out_snp_dict)
+    save_output(ambig_ref, out_snp_dict + '_ambig')
+    save_output(chr_names, out_snp_dict + '_chromosomes')
