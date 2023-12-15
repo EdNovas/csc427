@@ -23,3 +23,11 @@ codon run -plugin seq main.codon lava <input ref dict> <input SNP dict> <input F
 ## Unfortunate
 
 We failed to reimplement all and work as the lava program, however, most of the functions are made to perform the main process. Nevertheless, there are still bugs and failure if you run it. Hope to fix these if we could. 
+
+## Sample Output
+
+Reference:GRCh37/hg19: hg19.fa.gz
+
+Reads: SRR622461.filt.fastq.gz
+
+SNP list: Affymetrix Genome-Wide Human SNP Array 6.0: Affymetrix 6 SNPs.txt
